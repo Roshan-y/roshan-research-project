@@ -1,0 +1,3 @@
+#!/bin/bash
+
+plotbars.py --legend-in $@ < "/dev/stdin"

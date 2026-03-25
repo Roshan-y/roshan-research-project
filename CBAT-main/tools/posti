@@ -1,0 +1,12 @@
+#!/bin/bash
+
+if [ "$#" -ne "0" ] ; then
+    echo "USAGE: $0 // postpends 1 to line 1, 2 to line 2, ..."
+    exit 1
+fi
+
+i=0
+while IFS= read -r line; do
+    i=$((i+1))
+    printf '%s %s\n' "$line" "$i"
+done

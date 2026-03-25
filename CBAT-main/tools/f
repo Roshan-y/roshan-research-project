@@ -1,0 +1,32 @@
+#!/bin/bash
+
+hi=$1
+echo $hi | grep -vE "[^0-9]+" >/dev/null
+if [ "$?" -ne "0" ] ; then
+    hi=10
+else
+    shift
+fi
+
+for ((i=0;i<$hi;++i)) ; do
+    eval "$@"
+done
+
+
+
+
+
+
+# f() {
+#     hi=$1
+#     echo $hi | grep -vE "[^0-9]+" >/dev/null
+#     if [ "$?" -ne "0" ] ; then
+#         hi=10
+#     else
+#         shift
+#     fi
+
+#     for ((i=0;i<$hi;++i)) ; do
+#         eval "$@"
+#     done
+# }

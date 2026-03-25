@@ -1,0 +1,3 @@
+#!/bin/bash
+
+cat -u /dev/stdin | sed -u -re ' :restart ; s/([0-9])([0-9]{3})($|[^0-9])/\1,\2\3/ ; t restart '

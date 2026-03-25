@@ -1,0 +1,17 @@
+#!/bin/bash
+
+# note: to use multiple args, pass them all in "" with any necessary quotes in individual args as ''
+cat /dev/stdin | pee "distrib" "plot $@"
+
+
+## other approaches
+
+# { { cat /dev/stdin | tee /dev/fd/3 ; } | distrib >&2 ; } 3>&1 | plot $@
+
+#{
+#    {
+#        cat /dev/stdin | tee /dev/fd/3
+#    } | distrib >&2
+#} 3>&1 | plot $@
+
+# { { cat /dev/stdin | tee /dev/fd/3 /dev/fd/4; } 3>&1 | distrib >&2 ; } 4>&1 | plot $@
