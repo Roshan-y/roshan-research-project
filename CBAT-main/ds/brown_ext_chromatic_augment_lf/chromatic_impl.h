@@ -241,6 +241,35 @@ bool Chromatic<K,V,Compare,MasterRecordMgr>::contains(const int tid, const K& ke
 }
 
 template<class K, class V, class Compare, class MasterRecordMgr>
+const K Chromatic<K,V,Compare,MasterRecordMgr>::findMin(const int tid) {
+    auto guard = recordmgr->getGuard(tid, true);
+    return doFindMin(tid, (Version<K>*) root->version.load(memory_order_relaxed));
+}
+
+template<class K, class V, class Compare, class MasterRecordMgr>
+const K Chromatic<K,V,Compare,MasterRecordMgr>::doFindMin(const int tid, Version<K>* curr) {
+    while (((Version<K>*) curr->left.load(memory_order_relaxed)) != NULL) {
+        curr = (Version<K>*) curr->left.load(memory_order_relaxed);
+    }
+    return curr->key;
+}
+
+template<class K, class V, class Compare, class MasterRecordMgr>
+const K Chromatic<K,V,Compare,MasterRecordMgr>::findMax(const int tid) {
+    auto guard = recordmgr->getGuard(tid, true);
+    return doFindMax(tid, (Version<K>*) root->version.load(memory_order_relaxed));
+}
+
+template<class K, class V, class Compare, class MasterRecordMgr>
+const K Chromatic<K,V,Compare,MasterRecordMgr>::doFindMax(const int tid, Version<K>* curr) {
+    curr = (Version<K>*) curr->left.load(memory_order_relaxed);
+    while (((Version<K>*) curr->right.load(memory_order_relaxed)) != NULL) {
+        curr = (Version<K>*) curr->right.load(memory_order_relaxed);
+    }
+    return curr->key;
+}
+
+template<class K, class V, class Compare, class MasterRecordMgr>
 const pair<V,bool> Chromatic<K,V,Compare,MasterRecordMgr>::find(const int tid, const K& key) {
     TRACE COUTATOMICTSTID("find(tid="<<tid<<" key="<<key<<")"<<endl);
     pair<V,bool> result;

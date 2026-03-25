@@ -13,6 +13,7 @@ typedef long long test_type;
 #include <ctime>
 #include <thread>
 #include <atomic>
+#include <type_traits>
 #include <chrono>
 #include <cassert>
 #include <parallel/algorithm>
@@ -64,6 +65,12 @@ const char * PrefillTypeStrings[] = {
     "PREFILL_HYBRID"
 };
 
+enum MinMaxMode {
+    MINMAX_NONE,
+    MINMAX_MIN,
+    MINMAX_MAX
+};
+
 // some read-only globals (could be encapsulated in a struct and passed around to improve software engineering)
 
 #include "plaf.h"
@@ -90,6 +97,7 @@ PrefillType PREFILL_TYPE;
 bool AUTORQ = false;
 bool AUTOINSDEL = false;
 const char* QUERY_TEST_TYPE;
+MinMaxMode MINMAX_TEST_TYPE = MINMAX_NONE;
 int PREFILL_HYBRID_MIN_MS;
 int PREFILL_HYBRID_MAX_MS;
 PAD;
@@ -116,6 +124,38 @@ PAD;
 #include "adapter.h" /* data structure adapter header (selected according to the "ds/..." subdirectory in the -I include paths */
 #include "tree_stats.h"
 #define DS_ADAPTER_T ds_adapter<test_type, VALUE_TYPE, RECLAIM<>, ALLOC<>, POOL<> >
+
+template <typename T, typename = void>
+struct has_find_min : std::false_type {};
+
+template <typename T>
+struct has_find_min<T, std::void_t<decltype(std::declval<T*>()->findMin(0))>> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_find_max : std::false_type {};
+
+template <typename T>
+struct has_find_max<T, std::void_t<decltype(std::declval<T*>()->findMax(0))>> : std::true_type {};
+
+template <class DS, std::enable_if_t<has_find_min<DS>::value, int> = 0>
+auto invoke_find_min(DS * ds, int tid) {
+    return ds->findMin(tid);
+}
+
+template <class DS, std::enable_if_t<!has_find_min<DS>::value, int> = 0>
+void invoke_find_min(DS *, int) {
+    setbench_error("-min benchmark is not implemented for this data structure");
+}
+
+template <class DS, std::enable_if_t<has_find_max<DS>::value, int> = 0>
+auto invoke_find_max(DS * ds, int tid) {
+    return ds->findMax(tid);
+}
+
+template <class DS, std::enable_if_t<!has_find_max<DS>::value, int> = 0>
+void invoke_find_max(DS *, int) {
+    setbench_error("-max benchmark is not implemented for this data structure");
+}
 
 #ifndef INSERT_FUNC
     #define INSERT_FUNC insertIfAbsent
@@ -394,6 +434,15 @@ void thread_timed(GlobalsT * g, int __tid) {
         VERBOSE if (cnt&&((cnt % 1000000) == 0)) COUTATOMICTID("op# "<<cnt<<std::endl);
         test_type key = g->keygens[tid]->next();
         double op = g->rngs[tid].next(100000000) / 1000000.;
+        if (MINMAX_TEST_TYPE != MINMAX_NONE) {
+            if (MINMAX_TEST_TYPE == MINMAX_MIN) {
+                invoke_find_min(g->dsAdapter, tid);
+            } else {
+                invoke_find_max(g->dsAdapter, tid);
+            }
+            GSTATS_ADD(tid, num_searches, 1);
+            continue;
+        }
         if (op < INS_FRAC) {
             // TRACE COUTATOMICTID("### calling INSERT "<<key<<std::endl);
             if (SORTED_WORKLOAD) {
@@ -1268,6 +1317,7 @@ int main(int argc, char** argv) {
         std::cout<<"LD_PRELOAD=/path/to/libjemalloc.so "<<argv[0]<<" -nwork 64 -nprefill 64 -i 5 -d 5 -rq 0 -rqsize 1 -k 2000000 [-sparse] -nrq 0 -t 3000 -pin 0-15,32-47,16-31,48-63"<<std::endl;
         std::cout<<std::endl;
         std::cout<<"This command will benchmark the data structure corresponding to this binary with 64 threads repeatedly performing 5% key-inserts and 5% key-deletes and 90% key-searches (and 0% range queries with range query size set to a dummy value of 1 key), on random keys from the key range [1, 2000000] (or 2000000 random 64-bit keys if -sparse is provided), for 3000 ms. The data structure is initially prefilled by 64 threads to contain half of the key range. The -pin argument causes threads to be pinned. The specified thread pinning order is for one particular 64 thread system. (Try running ``lscpu'' and looking at ``NUMA node[0-9]'' for a reasonable pinning order.)"<<std::endl;
+        std::cout<<"For pure minimum/maximum benchmarks, use -min or -max with zero update/query fractions."<<std::endl;
         return 1;
     }
 
@@ -1282,6 +1332,7 @@ int main(int argc, char** argv) {
     RQ = 0;
     RANK = 0;
     SELECT = 0;
+    MINMAX_TEST_TYPE = MINMAX_NONE;
     INS_FRAC = 10;
     DEL_FRAC = 10;
     MAXKEY = 100000;
@@ -1315,6 +1366,12 @@ int main(int argc, char** argv) {
         } else if (strcmp(argv[i], "-sel") == 0) {
             SELECT = atof(argv[++i]);
             QUERY_TEST_TYPE = "-sel";
+        } else if (strcmp(argv[i], "-min") == 0) {
+            MINMAX_TEST_TYPE = MINMAX_MIN;
+            QUERY_TEST_TYPE = "-min";
+        } else if (strcmp(argv[i], "-max") == 0) {
+            MINMAX_TEST_TYPE = MINMAX_MAX;
+            QUERY_TEST_TYPE = "-max";
         } else if (strcmp(argv[i], "-autorq") == 0) {
             AUTORQ = true;
         } else if (strcmp(argv[i], "-autoinsdel") == 0) {

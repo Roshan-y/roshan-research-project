@@ -1,0 +1,10 @@
+#!/bin/bash
+
+if [ "$#" -ne "1" ] ; then
+    echo "USAGE: $0 TEXT_TO_PREPEND_ON_EACH_LINE"
+    exit 1
+fi
+
+while IFS= read -r line; do
+    printf '%s %s\n' "$1" "$line"
+done

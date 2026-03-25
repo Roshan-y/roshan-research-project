@@ -62,6 +62,12 @@ public:
     V find(const int tid, const K& key) {
         return ds->find(tid, key).first;
     }
+    K findMin(const int tid) {
+        return ds->findMin(tid);
+    }
+    K findMax(const int tid) {
+        return ds->findMax(tid);
+    }
     int getRank(const int tid, const K& key, K * const resultKeys, V * const resultValues) {
         return ds->getRank(tid, key);
     }

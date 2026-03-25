@@ -278,6 +278,10 @@ public:
     const V insertIfAbsent(const int tid, const K& key, const V& val);
     const pair<V,bool> erase(const int tid, const K& key);
     const pair<V,bool> find(const int tid, const K& key);
+    const K findMin(const int tid);
+    const K doFindMin(const int tid, Version<K>* curr);
+    const K findMax(const int tid);
+    const K doFindMax(const int tid, Version<K>* curr);
     const int getRank(const int tid, const K& key);
     const int doGetRank(const int tid, const K& key, Version<K>* curr);
     const int rangeQuery(const int tid, const K& lo, const K& hi);

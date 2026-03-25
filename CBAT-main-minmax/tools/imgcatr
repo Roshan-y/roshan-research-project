@@ -1,0 +1,11 @@
+#!/bin/bash
+
+if [ "$#" -ne "1" ] ; then
+    echo "USAGE: imgcatr image.png"
+    exit 1
+fi
+
+convert -resize @1000000 $1 ~/imgcatr_display.png
+imgcat ~/imgcatr_display.png
+
+exit 0

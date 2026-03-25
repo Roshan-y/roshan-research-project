@@ -1,0 +1,3 @@
+#!/bin/bash
+
+plotbars.py "$@" < "/dev/stdin"

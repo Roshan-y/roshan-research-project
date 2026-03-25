@@ -1,0 +1,18 @@
+#!/bin/bash
+
+# usage: g+[+note] [args] && [command to run if no compiler errors]
+
+# one-liner this script is derived from:
+# g++ [args] |& tee c | grep note | cut -d" " -f5- ; grep error c || [command to run on success]
+
+g++ "$@" 2>c
+
+grep note c | cut -d" " -f4-
+grep warning c
+
+grep -E "error|undefined" c
+if [ "$?" -ne "0" ] ; then
+    exit 0
+else
+    exit 1
+fi
