@@ -67,6 +67,12 @@ public:
         ds->search(key);
         return NO_VALUE; // Dummy return value
     }
+    K findMin(const int tid) {
+        return ds->findMin();
+    }
+    K findMax(const int tid) {
+        return ds->findMax();
+    }
     int rangeQuery(const int tid, const K& lo, const K& hi, K * const resultKeys, V * const resultValues) {
         // resultKeys and resultValues not required for this implementation
         return ds->range_sum(lo, hi);

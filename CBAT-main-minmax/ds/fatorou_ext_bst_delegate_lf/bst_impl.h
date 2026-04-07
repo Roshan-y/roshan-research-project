@@ -55,6 +55,12 @@ namespace SUB_ERIC_TREE
         int key = 0;
         int min_key = -MAX_KEY;
         int max_key = MAX_KEY;
+        // real_min/real_max exclude sentinel keys (-MAX_KEY and MAX_KEY).
+        // Sentinels contribute identity values so propagation is correct:
+        //   real_min identity = MAX_KEY,  real_max identity = -MAX_KEY.
+        // Empty tree: real_min == MAX_KEY and real_max == -MAX_KEY.
+        int real_min = MAX_KEY;
+        int real_max = -MAX_KEY;
         long long sum = 0;
         VersionInfo *child[2] = {nullptr, nullptr};
     };
@@ -116,6 +122,12 @@ namespace SUB_ERIC_TREE
             info->key = k;
             info->sum = v;
             info->min_key = info->max_key = k;
+            if (k == -MAX_KEY || k == MAX_KEY) {
+                info->real_min = MAX_KEY;
+                info->real_max = -MAX_KEY;
+            } else {
+                info->real_min = info->real_max = k;
+            }
             // this->version.store(info);
             this->version_status.store(BundledVersionPointer(info));
         }
@@ -138,12 +150,16 @@ namespace SUB_ERIC_TREE
             info->sum = 0;
             info->min_key = -MAX_KEY;
             info->max_key = MAX_KEY;
+            info->real_min = MAX_KEY;
+            info->real_max = -MAX_KEY;
             if (l != nullptr)
             {
                 VersionInfo *l_version = l->version_status.load().version;
                 info->child[0] = l_version;
                 info->sum += l_version->sum;
                 info->min_key = info->max_key = l->key;
+                info->real_min = std::min(info->real_min, l_version->real_min);
+                info->real_max = std::max(info->real_max, l_version->real_max);
             }
             if (r != nullptr)
             {
@@ -152,6 +168,8 @@ namespace SUB_ERIC_TREE
                 info->sum += r_version->sum;
                 info->min_key = std::min(info->min_key, r->key);
                 info->max_key = std::max(info->max_key, r->key);
+                info->real_min = std::min(info->real_min, r_version->real_min);
+                info->real_max = std::max(info->real_max, r_version->real_max);
             }
             this->version_status.store(BundledVersionPointer(info));
         }
@@ -245,6 +263,8 @@ namespace SUB_ERIC_TREE
             new_version->sum = left_version->sum + right_version->sum;
             new_version->min_key = std::min(left_version->min_key, right_version->min_key);
             new_version->max_key = std::max(left_version->max_key, right_version->max_key);
+            new_version->real_min = std::min(left_version->real_min, right_version->real_min);
+            new_version->real_max = std::max(left_version->real_max, right_version->real_max);
             return new_version;
         }
 
@@ -565,6 +585,20 @@ namespace SUB_ERIC_TREE
                     { cnt++; },
                     [](InternalNode *in) {});
             return cnt;
+        }
+
+        int findMin(int tid)
+        {
+            auto guard = recordmgr->getGuard(tid, true);
+            int v = root->version_status.load().version->real_min;
+            return (v == MAX_KEY) ? SENTINAL_VALUE : v;
+        }
+
+        int findMax(int tid)
+        {
+            auto guard = recordmgr->getGuard(tid, true);
+            int v = root->version_status.load().version->real_max;
+            return (v == -MAX_KEY) ? SENTINAL_VALUE : v;
         }
 
         void print()
