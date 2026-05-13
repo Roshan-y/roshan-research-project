@@ -39,11 +39,11 @@ public:
         while (cur != nullptr) {
             MarkedPtr nw = read_next(cur);
             Node* next = nw.ptr_;
-            // Free the current CollisionlessPtr (best-effort; others are leaked).
+            bool is_tail = (cur == tail_);
             CollisionlessPtr cp = read_prev(cur);
             if (cp) delete cp;
             delete cur;
-            if (cur == tail_) break;
+            if (is_tail) break;
             cur = next;
         }
     }

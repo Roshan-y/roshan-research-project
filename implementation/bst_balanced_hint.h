@@ -647,9 +647,15 @@ class BalancedHintBST {
         }
     }
 
+    // Attempt up to MAX_REBAL_ITERS rebalancing steps on the path to key.
+    // Because BalancedHintBST is used only as a hint index, a partially
+    // unbalanced tree is harmless — it only lengthens list traversal.
+    // Bounding iterations prevents livelock when concurrent LLX failures
+    // cause update_rebalance to return false repeatedly.
+    static constexpr int MAX_REBAL_ITERS = 200;
     void fix_all(long key) {
-        bool done = false;
-        while (!done) done = update_rebalance(key);
+        for (int i = 0; i < MAX_REBAL_ITERS; ++i)
+            if (update_rebalance(key)) return;
     }
 
 public:

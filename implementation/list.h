@@ -434,8 +434,9 @@ static inline long list_extract_max(Node* head, Node* tail) {
             MarkedPtr nw = read_next(cur);
 
             if (nw.state_ == ExtMax) {
-                // Another extractMax already claimed this node — help physically remove it
-                // and return its key.
+                // Another extractMax already claimed this node.  Help physically remove it
+                // (best-effort) but do NOT return its key — the owning thread returns it.
+                // Advancing past this node lets us find the next viable victim.
                 Node* pred = unwrap(read_prev(cur));
                 if (pred == nullptr) pred = head;
                 NodeSnapshot snap_pred   = take_snapshot(pred);
@@ -449,7 +450,9 @@ static inline long list_extract_max(Node* head, Node* tail) {
                         cas_next(pred, pexp, {nw.ptr_, Ok});
                     post_evict_fix(snap_pred, snap_cur);
                 }
-                return cur->key_;
+                // Advance past the ExtMax node (nw.ptr_ == tail for the maximum).
+                cur = nw.ptr_;
+                continue;
             }
 
             if (nw.state_ == Ok) victim = cur;
@@ -467,21 +470,35 @@ static inline long list_extract_max(Node* head, Node* tail) {
         if (!cas_next(victim, vexp, {tail, ExtMax}))
             continue;  // lost the stamp race
 
-        // We own victim. Physically remove it by updating pred->next_ to skip victim.
+        // We own victim (we hold the ExtMax stamp).  Physically remove it.
+        // Another thread's normalize may have already done this — detect that and return.
         while (true) {
+            // A concurrent extract_min epoch may have already unlinked victim.
+            // Help it complete so !found_victim below can detect this and return.
+            if (read_next(head).state_ == ExtMin)
+                help_ext_min(head, tail);
+
             Node* pred = unwrap(read_prev(victim));
             if (pred == nullptr) pred = head;
 
-            // Walk pred forward to find the node that currently points to victim.
+            // Walk pred forward to find a LIVE node whose next points to victim.
+            // Require pnw.state_ == Ok: pred must not itself be logically deleted.
+            // A deleted pred (pnw.state_ != Ok) cannot serve as the CAS target.
+            bool found_victim = false;
             for (int i = 0; i < 64; ++i) {
                 MarkedPtr pnw = read_next(pred);
-                if (pnw.ptr_ == victim) break;
+                if (pnw.ptr_ == victim && pnw.state_ == Ok) { found_victim = true; break; }
                 if (pnw.state_ != Ok || pnw.ptr_ == nullptr ||
                     pnw.ptr_->key_ > victim->key_) {
                     pred = head; break;
                 }
                 pred = pnw.ptr_;
             }
+
+            // If victim is no longer reachable, another thread's normalize already
+            // unlinked it (as a side-effect of its own traversal).  We own the stamp,
+            // so we are the one that returns the key — no double-extraction possible.
+            if (!found_victim) return victim->key_;
 
             NodeSnapshot snap_pred   = take_snapshot(pred);
             NodeSnapshot snap_victim = take_snapshot(victim);
