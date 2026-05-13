@@ -231,9 +231,6 @@ double bench_extract_min(int n_threads, int key_range) {
     std::atomic<bool> go{false};
     std::atomic<bool> stop{false};
     std::atomic<long long> total_ops{0};
-    // A shared counter to refill keys
-    std::atomic<long> next_key{key_range};
-
     auto worker = [&](int tid) {
         (void)tid;
         std::mt19937 rng(tid * 7654321u + 11111u);

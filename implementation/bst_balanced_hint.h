@@ -682,12 +682,6 @@ public:
         if (rebal) fix_all(key);
     }
 
-    // Remove key from the hint index.  Best-effort; stale hints are harmless.
-    void try_remove(long key) {
-        bool rebal = false;
-        while (!update_erase(key, &rebal)) { /* retry */ }
-        if (rebal) fix_all(key);
-    }
 };
 
 } // namespace bst_balanced_hint

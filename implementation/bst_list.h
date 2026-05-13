@@ -66,8 +66,6 @@ public:
     bool remove(long key) {
         Node* hint = bst_.find_close(key);
         return list_erase(head_, hint, key);
-        // Intentionally skip bst_.try_remove(key) to avoid a race where a concurrent
-        // re-insertion's BST entry would be silently removed. Stale BST hints are harmless.
     }
 
     // Return the minimum key, or NO_KEY if the set is empty.

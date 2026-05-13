@@ -129,9 +129,7 @@ public:
         root_->children[1].store(0, std::memory_order_relaxed);
     }
 
-    ~HintBST() {
-        // TODO: traverse and free all BSTNodes (currently leaked)
-    }
+    ~HintBST() = default;
 
     // Return a list Node* close to key, or nullptr if the BST has no useful hint.
     Node* find_close(long key) const {
@@ -187,42 +185,6 @@ public:
         }
     }
 
-    // Remove key from the BST hint index. Best-effort; stale hints are harmless.
-    void try_remove(long key) {
-        while (true) {
-            SeekRecord sr;
-            seek(key, sr);
-
-            if (sr.leaf->key != key) return;
-
-            if (!bst_free(sr.parent_child_w)) {
-                help_conflicting(sr);
-                continue;
-            }
-
-            uintptr_t expected = sr.parent_child_w;
-            if (!sr.parent->children[sr.parent_dir].compare_exchange_strong(
-                    expected, expected | FLAG_BIT,
-                    std::memory_order_acq_rel, std::memory_order_acquire))
-                continue;
-
-            int sib_dir = 1 - sr.parent_dir;
-            uintptr_t sib_w = sr.parent->children[sib_dir].load(std::memory_order_acquire);
-            while (!bst_marked(sib_w)) {
-                if (sr.parent->children[sib_dir].compare_exchange_weak(
-                        sib_w, sib_w | MARK_BIT,
-                        std::memory_order_acq_rel, std::memory_order_acquire))
-                    break;
-            }
-
-            uintptr_t new_child = bst_encode(bst_addr(sib_w), false, bst_flagged(sib_w));
-            uintptr_t lum_exp   = sr.lum_child_w;
-            sr.lum->children[sr.lum_dir].compare_exchange_strong(
-                lum_exp, new_child,
-                std::memory_order_acq_rel, std::memory_order_acquire);
-            return;
-        }
-    }
 };
 
 } // namespace bst_hint
