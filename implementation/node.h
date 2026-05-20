@@ -3,6 +3,10 @@
 #include <climits>
 #include <cstdint>
 
+// Forward-declare Debra so cas_prev can accept it without a circular include.
+// debra.h includes node.h after its own class definition.
+class Debra;
+
 static constexpr long KEY_MIN = LONG_MIN;
 static constexpr long KEY_MAX = LONG_MAX;
 static constexpr long NO_KEY  = LONG_MIN;
@@ -94,15 +98,9 @@ inline bool cas_next(Node* x, MarkedPtr& y, MarkedPtr z) noexcept {
     return false;
 }
 
-// CAS on prev_. Creates a new PrevWrapper for z_node. Old wrapper not freed (no reclamation).
-// On success y = new PrevWrapper(z_node); on failure y = current prev_.
-inline bool cas_prev(Node* x, CollisionlessPtr& y, Node* z_node) noexcept {
-    PrevWrapper* pw = new PrevWrapper(z_node);
-    if (x->prev_.compare_exchange_strong(y, pw,
-                std::memory_order_acq_rel, std::memory_order_acquire)) {
-        y = pw;
-        return true;
-    }
-    delete pw;   // never published; safe to free immediately
-    return false;
-}
+// CAS on prev_. Creates a new PrevWrapper for z_node.
+// On success: retires the old PrevWrapper via DEBRA; y = new wrapper.
+// On failure: deletes the unpublished new wrapper; y = current prev_.
+// Full definition lives in debra.h (after Debra is complete).
+inline bool cas_prev(Node* x, CollisionlessPtr& y, Node* z_node,
+                     Debra* debra, int tid) noexcept;

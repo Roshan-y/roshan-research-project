@@ -1,82 +1,87 @@
 #pragma once
-#include "node.h"
+#include "debra.h"
 #include "bst_hint.h"
 #include "list.h"
 
-// BSTList: a concurrent ordered set whose ordering is defined by a lock-free
+// BSTList: a concurrent ordered structure whose ordering is defined by a lock-free
 // doubly-linked list and whose search is accelerated by a lock-free BST hint index.
 //
-// The list is the sole source of correctness. The BST is an auxiliary hint layer
-// that returns a Node* close to the target key so that list traversal starts there
-// rather than at head. If the BST hint is stale or wrong, the list operation is
-// still correct — it just starts farther from the target.
-//
-// Follows the integration described in Listing 5 of Melnikov & Sela.
+// Memory reclamation: DEBRA epoch-based (Trevor Brown, PODC 2015).
+// All public methods take an explicit int tid (Option A).
 
 class BSTList {
     Node* head_;
     Node* tail_;
     bst_hint::HintBST bst_;
+    Debra debra_;
 
 public:
-    BSTList() {
+    explicit BSTList(int num_threads = DEBRA_MAX_THREADS)
+        : debra_(num_threads)
+    {
         head_ = new Node(KEY_MIN);
         tail_ = new Node(KEY_MAX);
 
-        // head_->next_ = {tail_, Ok}; head has no predecessor
         head_->next_.store(mp_encode({tail_, Ok}), std::memory_order_relaxed);
         head_->prev_.store(nullptr,                std::memory_order_relaxed);
 
-        // tail_->next_ = {nullptr, Ok}; barrier() treats null successor as trivially ok
         tail_->next_.store(mp_encode({nullptr, Ok}), std::memory_order_relaxed);
-        // tail_->prev_ is kept approximate by barrier() calls; initialize to head
         tail_->prev_.store(new PrevWrapper(head_),   std::memory_order_relaxed);
     }
 
     ~BSTList() {
-        // Walk and free reachable list nodes via the next_ chain.
+        // Walk all physically reachable nodes (live + logically-deleted but not yet
+        // physically removed). These were never retired, so DEBRA's ~Debra() won't
+        // free them. DEBRA's destructor handles nodes already in epoch bags.
         Node* cur = head_;
         while (cur != nullptr) {
-            MarkedPtr nw = read_next(cur);
-            Node* next = nw.ptr_;
-            bool is_tail = (cur == tail_);
-            CollisionlessPtr cp = read_prev(cur);
-            if (cp) delete cp;
+            Node* next = read_next(cur).ptr_;
+            CollisionlessPtr pw = cur->prev_.load(std::memory_order_relaxed);
+            if (pw) delete pw;
             delete cur;
-            if (is_tail) break;
+            if (cur == tail_) break;
             cur = next;
         }
+        // ~Debra() runs next and drains epoch bags (retired nodes).
     }
 
-    // Insert key. Returns true if inserted, false if already present.
-    bool insert(long key) {
-        Node* hint = bst_.find_close(key);
-        bool ok = list_insert(head_, tail_, hint, key);
+    bool insert(int tid, long key) {
+        debra_.leaveQuiescentState(tid);
+        Node* hint     = bst_.find_close(key);
+        Node* new_node = debra_.allocNode(tid, key);
+        bool ok = list_insert(head_, tail_, hint, key, new_node, &debra_, tid);
         if (ok) {
-            // Locate the newly inserted node so the BST hint stays current.
             NodeSnapshot pred, curr;
-            list_find(head_, hint, key, &pred, &curr);
+            list_find(head_, hint, key, &pred, &curr, &debra_, tid);
             if (curr.self_->key_ == key)
                 bst_.try_set(key, curr.self_);
         }
+        debra_.enterQuiescentState(tid);
         return ok;
     }
 
-    // Remove key. Returns true if this call performed the logical deletion.
-    bool remove(long key) {
+    bool remove(int tid, long key) {
+        debra_.leaveQuiescentState(tid);
         Node* hint = bst_.find_close(key);
-        return list_erase(head_, hint, key);
+        bool ok = list_erase(head_, hint, key, &debra_, tid);
+        debra_.enterQuiescentState(tid);
+        return ok;
     }
 
-    // Return the minimum key, or NO_KEY if the set is empty.
     long min() const { return list_min(head_, tail_); }
-
-    // Return the maximum key, or NO_KEY if the set is empty.
     long max() const { return list_max(head_, tail_); }
 
-    // Remove and return the minimum key, or NO_KEY if the set is empty.
-    long extract_min() { return list_extract_min(head_, tail_); }
+    long extract_min(int tid) {
+        debra_.leaveQuiescentState(tid);
+        long v = list_extract_min(head_, tail_, &debra_, tid);
+        debra_.enterQuiescentState(tid);
+        return v;
+    }
 
-    // Remove and return the maximum key, or NO_KEY if the set is empty.
-    long extract_max() { return list_extract_max(head_, tail_); }
+    long extract_max(int tid) {
+        debra_.leaveQuiescentState(tid);
+        long v = list_extract_max(head_, tail_, &debra_, tid);
+        debra_.enterQuiescentState(tid);
+        return v;
+    }
 };

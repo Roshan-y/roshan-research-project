@@ -20,7 +20,8 @@
 #include <string>
 
 using Clock = std::chrono::steady_clock;
-static constexpr int BENCH_SECS = 3;
+static constexpr int BENCH_SECS    = 3;
+static constexpr int MAX_THREADS   = 64;
 
 // -------------------------------------------------------------------------
 // Generic mixed benchmark: 40% insert, 40% remove, 20% min+max
@@ -28,14 +29,13 @@ static constexpr int BENCH_SECS = 3;
 // -------------------------------------------------------------------------
 template <class S>
 double bench_mixed(int n_threads, int key_range) {
-    S s;
-    // Pre-fill with key_range/2 random keys
+    S s(MAX_THREADS);
     {
         std::mt19937 rng(42);
         std::uniform_int_distribution<long> kd(0, key_range - 1);
         int inserted = 0;
         while (inserted < key_range / 2) {
-            if (s.insert(kd(rng))) ++inserted;
+            if (s.insert(0, kd(rng))) ++inserted;
         }
     }
 
@@ -46,7 +46,7 @@ double bench_mixed(int n_threads, int key_range) {
     auto worker = [&](int tid) {
         std::mt19937 rng(tid * 1234567u + 99991u);
         std::uniform_int_distribution<long> kd(0, key_range - 1);
-        std::uniform_int_distribution<int>  od(0, 4);  // 0-1=ins, 2-3=rem, 4=minmax
+        std::uniform_int_distribution<int>  od(0, 4);
 
         while (!go.load(std::memory_order_acquire)) {}
 
@@ -54,8 +54,8 @@ double bench_mixed(int n_threads, int key_range) {
         while (!stop.load(std::memory_order_relaxed)) {
             int op = od(rng);
             long key = kd(rng);
-            if (op <= 1)      { s.insert(key); }
-            else if (op <= 3) { s.remove(key); }
+            if (op <= 1)      { s.insert(tid, key); }
+            else if (op <= 3) { s.remove(tid, key); }
             else              { s.min(); s.max(); }
             ++ops;
         }
@@ -78,19 +78,17 @@ double bench_mixed(int n_threads, int key_range) {
 }
 
 // -------------------------------------------------------------------------
-// Insert-only benchmark: all threads insert random keys.
-// Returns Mops/s (insert attempts; duplicates are no-ops).
+// Insert-only benchmark
 // -------------------------------------------------------------------------
 template <class S>
 double bench_insert(int n_threads, int key_range) {
-    S s;
-    // Pre-fill to ~25% so there is room to insert without constantly hitting duplicates.
+    S s(MAX_THREADS);
     {
         std::mt19937 rng(42);
         std::uniform_int_distribution<long> kd(0, key_range - 1);
         int inserted = 0;
         while (inserted < key_range / 4) {
-            if (s.insert(kd(rng))) ++inserted;
+            if (s.insert(0, kd(rng))) ++inserted;
         }
     }
 
@@ -104,7 +102,7 @@ double bench_insert(int n_threads, int key_range) {
         while (!go.load(std::memory_order_acquire)) {}
         long long ops = 0;
         while (!stop.load(std::memory_order_relaxed)) {
-            s.insert(kd(rng));
+            s.insert(tid, kd(rng));
             ++ops;
         }
         total_ops.fetch_add(ops, std::memory_order_relaxed);
@@ -123,18 +121,17 @@ double bench_insert(int n_threads, int key_range) {
 }
 
 // -------------------------------------------------------------------------
-// Remove-only benchmark: all threads remove random keys, refilling when empty.
-// Returns Mops/s (remove attempts).
+// Remove-only benchmark
 // -------------------------------------------------------------------------
 template <class S>
 double bench_remove(int n_threads, int key_range) {
-    S s;
+    S s(MAX_THREADS);
     {
         std::mt19937 rng(42);
         std::uniform_int_distribution<long> kd(0, key_range - 1);
         int inserted = 0;
         while (inserted < key_range / 2) {
-            if (s.insert(kd(rng))) ++inserted;
+            if (s.insert(0, kd(rng))) ++inserted;
         }
     }
 
@@ -148,9 +145,8 @@ double bench_remove(int n_threads, int key_range) {
         while (!go.load(std::memory_order_acquire)) {}
         long long ops = 0;
         while (!stop.load(std::memory_order_relaxed)) {
-            if (!s.remove(kd(rng))) {
-                // Refill a few keys so threads always have something to remove.
-                for (int i = 0; i < 4; ++i) s.insert(kd(rng));
+            if (!s.remove(tid, kd(rng))) {
+                for (int i = 0; i < 4; ++i) s.insert(tid, kd(rng));
             }
             ++ops;
         }
@@ -170,18 +166,17 @@ double bench_remove(int n_threads, int key_range) {
 }
 
 // -------------------------------------------------------------------------
-// Min+Max-only benchmark: all threads alternate min() and max() calls.
-// Returns Mops/s (each call counted as one op).
+// Min+Max-only benchmark
 // -------------------------------------------------------------------------
 template <class S>
 double bench_min_max(int n_threads, int key_range) {
-    S s;
+    S s(MAX_THREADS);
     {
         std::mt19937 rng(42);
         std::uniform_int_distribution<long> kd(0, key_range - 1);
         int inserted = 0;
         while (inserted < key_range / 2) {
-            if (s.insert(kd(rng))) ++inserted;
+            if (s.insert(0, kd(rng))) ++inserted;
         }
     }
 
@@ -213,26 +208,25 @@ double bench_min_max(int n_threads, int key_range) {
 }
 
 // -------------------------------------------------------------------------
-// Extract_min benchmark: threads only call extract_min, refilling as needed
-// Returns Mops/s
+// Extract_min benchmark
 // -------------------------------------------------------------------------
 template <class S>
 double bench_extract_min(int n_threads, int key_range) {
-    S s;
+    S s(MAX_THREADS);
     {
         std::mt19937 rng(42);
         std::uniform_int_distribution<long> kd(0, key_range - 1);
         int inserted = 0;
         while (inserted < key_range / 2) {
-            if (s.insert(kd(rng))) ++inserted;
+            if (s.insert(0, kd(rng))) ++inserted;
         }
     }
 
     std::atomic<bool> go{false};
     std::atomic<bool> stop{false};
     std::atomic<long long> total_ops{0};
+
     auto worker = [&](int tid) {
-        (void)tid;
         std::mt19937 rng(tid * 7654321u + 11111u);
         std::uniform_int_distribution<long> kd(0, key_range - 1);
 
@@ -240,11 +234,10 @@ double bench_extract_min(int n_threads, int key_range) {
 
         long long ops = 0;
         while (!stop.load(std::memory_order_relaxed)) {
-            long v = s.extract_min();
+            long v = s.extract_min(tid);
             if (v == NO_KEY) {
-                // Refill a small batch
                 for (int i = 0; i < 8; ++i)
-                    s.insert(kd(rng));
+                    s.insert(tid, kd(rng));
             }
             ++ops;
         }
@@ -271,13 +264,13 @@ double bench_extract_min(int n_threads, int key_range) {
 // -------------------------------------------------------------------------
 template <class S>
 double bench_extract_max(int n_threads, int key_range) {
-    S s;
+    S s(MAX_THREADS);
     {
         std::mt19937 rng(42);
         std::uniform_int_distribution<long> kd(0, key_range - 1);
         int inserted = 0;
         while (inserted < key_range / 2) {
-            if (s.insert(kd(rng))) ++inserted;
+            if (s.insert(0, kd(rng))) ++inserted;
         }
     }
 
@@ -286,7 +279,6 @@ double bench_extract_max(int n_threads, int key_range) {
     std::atomic<long long> total_ops{0};
 
     auto worker = [&](int tid) {
-        (void)tid;
         std::mt19937 rng(tid * 3456789u + 22222u);
         std::uniform_int_distribution<long> kd(0, key_range - 1);
 
@@ -294,10 +286,10 @@ double bench_extract_max(int n_threads, int key_range) {
 
         long long ops = 0;
         while (!stop.load(std::memory_order_relaxed)) {
-            long v = s.extract_max();
+            long v = s.extract_max(tid);
             if (v == NO_KEY) {
                 for (int i = 0; i < 8; ++i)
-                    s.insert(kd(rng));
+                    s.insert(tid, kd(rng));
             }
             ++ops;
         }
@@ -327,21 +319,12 @@ int main() {
     const int key_ranges[]    = {1000, 10000, 100000};
     const int N_TC = 6, N_KR = 3;
 
-    const char* variant_names[] = {
-        "BSTList",
-        "BSTListBalanced",
-        "BSTListPragmatic",
-        "BSTListBalancedPragmatic"
-    };
-
-    printf("# Throughput Benchmark Results\n\n");
+    printf("# Throughput Benchmark Results (with DEBRA GC)\n\n");
     printf("Benchmark duration per run: %d seconds\n", BENCH_SECS);
     printf("Mix: 40%% insert, 40%% remove, 20%% min+max\n\n");
 
-    // ---- Mixed throughput tables ----
     printf("## Mixed Throughput (Mops/s)\n\n");
 
-    // One table per key_range
     for (int ki = 0; ki < N_KR; ++ki) {
         int kr = key_ranges[ki];
         printf("### Key Range = %d\n\n", kr);
@@ -361,7 +344,6 @@ int main() {
         printf("\n");
     }
 
-    // ---- Per-operation breakdown at 8 threads x 10000 keys ----
     printf("## Per-Operation Throughput at 8 threads, key_range=10000 (Mops/s)\n\n");
     printf("| Variant | insert | remove | min+max | extract_min | extract_max |\n");
     printf("|---------|--------|--------|---------|-------------|-------------|\n");

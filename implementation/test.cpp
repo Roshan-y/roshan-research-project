@@ -1,7 +1,7 @@
 // Correctness tests for all four BST+List variants.
 //
 // Compile:
-//   g++ -std=c++17 -O2 -pthread -o test implementation/test.cpp
+//   g++ -std=c++17 -O2 -pthread -o test test.cpp
 // Run:
 //   ./test
 
@@ -21,29 +21,30 @@
 
 // ============================================================
 // Templated correctness tests — run on any type S that exposes:
-//   bool insert(long), bool remove(long),
-//   long min(), long max(), long extract_min(), long extract_max()
+//   bool insert(int tid, long), bool remove(int tid, long),
+//   long min(), long max(),
+//   long extract_min(int tid), long extract_max(int tid)
 // ============================================================
 
 template <class S>
 static void t_empty(const char* name) {
     S s;
-    assert(s.min()         == NO_KEY);
-    assert(s.max()         == NO_KEY);
-    assert(s.extract_min() == NO_KEY);
-    assert(s.extract_max() == NO_KEY);
+    assert(s.min()            == NO_KEY);
+    assert(s.max()            == NO_KEY);
+    assert(s.extract_min(0)   == NO_KEY);
+    assert(s.extract_max(0)   == NO_KEY);
     printf("  [%s] test_empty                      PASS\n", name);
 }
 
 template <class S>
 static void t_single(const char* name) {
     S s;
-    assert( s.insert(42));
-    assert(!s.insert(42));     // duplicate
+    assert( s.insert(0, 42));
+    assert(!s.insert(0, 42));     // duplicate
     assert(s.min() == 42);
     assert(s.max() == 42);
-    assert( s.remove(42));
-    assert(!s.remove(42));     // already gone
+    assert( s.remove(0, 42));
+    assert(!s.remove(0, 42));     // already gone
     assert(s.min() == NO_KEY);
     assert(s.max() == NO_KEY);
     printf("  [%s] test_single                     PASS\n", name);
@@ -52,10 +53,10 @@ static void t_single(const char* name) {
 template <class S>
 static void t_ordered_inserts(const char* name) {
     S s;
-    for (int i = 1; i <= 100; ++i) assert(s.insert(i));
+    for (int i = 1; i <= 100; ++i) assert(s.insert(0, i));
     assert(s.min() == 1);
     assert(s.max() == 100);
-    for (int i = 1; i <= 100; ++i) assert(s.remove(i));
+    for (int i = 1; i <= 100; ++i) assert(s.remove(0, i));
     assert(s.min() == NO_KEY);
     assert(s.max() == NO_KEY);
     printf("  [%s] test_ordered_inserts            PASS\n", name);
@@ -64,7 +65,7 @@ static void t_ordered_inserts(const char* name) {
 template <class S>
 static void t_reverse_inserts(const char* name) {
     S s;
-    for (int i = 100; i >= 1; --i) assert(s.insert(i));
+    for (int i = 100; i >= 1; --i) assert(s.insert(0, i));
     assert(s.min() == 1);
     assert(s.max() == 100);
     printf("  [%s] test_reverse_inserts            PASS\n", name);
@@ -74,14 +75,14 @@ template <class S>
 static void t_mixed_ops(const char* name) {
     S s;
     std::vector<int> keys = {5, 3, 8, 1, 9, 2, 7, 4, 6, 10};
-    for (int k : keys) s.insert(k);
+    for (int k : keys) s.insert(0, k);
     assert(s.min() == 1);
     assert(s.max() == 10);
 
-    s.remove(1);  assert(s.min() == 2);
-    s.remove(10); assert(s.max() == 9);
-    s.insert(0);  assert(s.min() == 0);
-    s.insert(11); assert(s.max() == 11);
+    s.remove(0, 1);  assert(s.min() == 2);
+    s.remove(0, 10); assert(s.max() == 9);
+    s.insert(0, 0);  assert(s.min() == 0);
+    s.insert(0, 11); assert(s.max() == 11);
     printf("  [%s] test_mixed_ops                  PASS\n", name);
 }
 
@@ -89,11 +90,11 @@ static void t_mixed_ops(const char* name) {
 template <class S>
 static void t_concurrent(const char* name, int n_threads = 8,
                           int per_thread = 1000) {
-    S s;
+    S s(n_threads);
     auto worker = [&](int tid) {
         int base = tid * per_thread;
-        for (int i = 0; i < per_thread; ++i) s.insert(base + i);
-        for (int i = 0; i < per_thread; ++i) s.remove(base + i);
+        for (int i = 0; i < per_thread; ++i) s.insert(tid, base + i);
+        for (int i = 0; i < per_thread; ++i) s.remove(tid, base + i);
     };
     std::vector<std::thread> ths;
     ths.reserve(n_threads);
@@ -108,13 +109,13 @@ static void t_concurrent(const char* name, int n_threads = 8,
 template <class S>
 static void t_concurrent_contended(const char* name, int n_threads = 8) {
     constexpr int OPS = 2000, KEY_RANGE = 64;
-    S s;
+    S s(n_threads);
     auto worker = [&](int tid) {
         std::mt19937 rng(tid * 1234567u);
         std::uniform_int_distribution<int> kd(0, KEY_RANGE - 1), od(0, 1);
         for (int i = 0; i < OPS; ++i) {
-            if (od(rng) == 0) s.insert(kd(rng));
-            else              s.remove(kd(rng));
+            if (od(rng) == 0) s.insert(tid, kd(rng));
+            else              s.remove(tid, kd(rng));
         }
     };
     std::vector<std::thread> ths;
@@ -130,39 +131,35 @@ static void t_concurrent_contended(const char* name, int n_threads = 8) {
 // ---------- extract_min / extract_max sequential ----------
 template <class S>
 static void t_extract_seq(const char* name) {
-    // extract_min on ordered sequence
     {
         S s;
-        for (int i = 1; i <= 10; ++i) s.insert(i);
-        for (int i = 1; i <= 10; ++i) { long v = s.extract_min(); assert(v == i); }
-        assert(s.extract_min() == NO_KEY);
+        for (int i = 1; i <= 10; ++i) s.insert(0, i);
+        for (int i = 1; i <= 10; ++i) { long v = s.extract_min(0); assert(v == i); }
+        assert(s.extract_min(0) == NO_KEY);
     }
-    // extract_max on ordered sequence
     {
         S s;
-        for (int i = 1; i <= 10; ++i) s.insert(i);
-        for (int i = 10; i >= 1; --i) { long v = s.extract_max(); assert(v == i); }
-        assert(s.extract_max() == NO_KEY);
+        for (int i = 1; i <= 10; ++i) s.insert(0, i);
+        for (int i = 10; i >= 1; --i) { long v = s.extract_max(0); assert(v == i); }
+        assert(s.extract_max(0) == NO_KEY);
     }
-    // extract_min skipping removed nodes
     {
         S s;
-        for (int i = 1; i <= 5; ++i) s.insert(i);
-        s.remove(2); s.remove(4);
-        assert(s.extract_min() == 1);
-        assert(s.extract_min() == 3);
-        assert(s.extract_min() == 5);
-        assert(s.extract_min() == NO_KEY);
+        for (int i = 1; i <= 5; ++i) s.insert(0, i);
+        s.remove(0, 2); s.remove(0, 4);
+        assert(s.extract_min(0) == 1);
+        assert(s.extract_min(0) == 3);
+        assert(s.extract_min(0) == 5);
+        assert(s.extract_min(0) == NO_KEY);
     }
-    // extract_max skipping removed nodes
     {
         S s;
-        for (int i = 1; i <= 5; ++i) s.insert(i);
-        s.remove(2); s.remove(4);
-        assert(s.extract_max() == 5);
-        assert(s.extract_max() == 3);
-        assert(s.extract_max() == 1);
-        assert(s.extract_max() == NO_KEY);
+        for (int i = 1; i <= 5; ++i) s.insert(0, i);
+        s.remove(0, 2); s.remove(0, 4);
+        assert(s.extract_max(0) == 5);
+        assert(s.extract_max(0) == 3);
+        assert(s.extract_max(0) == 1);
+        assert(s.extract_max(0) == NO_KEY);
     }
     printf("  [%s] test_extract_sequential         PASS\n", name);
 }
@@ -173,23 +170,25 @@ static void t_concurrent_extract_min(const char* name,
                                      int n_ins = 4, int n_ext = 4,
                                      int per = 500) {
     int total = n_ins * per;
-    S s;
+    int n_threads = n_ins + n_ext;
+    S s(n_threads);
     std::atomic<int> ins_done{0};
     std::vector<std::vector<long>> extracted(n_ext);
 
     std::vector<std::thread> ths;
-    ths.reserve(n_ins + n_ext);
+    ths.reserve(n_threads);
 
     for (int t = 0; t < n_ins; ++t)
         ths.emplace_back([&, t]() {
-            for (int i = 0; i < per; ++i) s.insert(t * per + i);
+            for (int i = 0; i < per; ++i) s.insert(t, t * per + i);
             ins_done.fetch_add(1, std::memory_order_release);
         });
 
     for (int t = 0; t < n_ext; ++t)
         ths.emplace_back([&, t]() {
+            int my_tid = n_ins + t;
             while (true) {
-                long v = s.extract_min();
+                long v = s.extract_min(my_tid);
                 if (v == NO_KEY) {
                     if (ins_done.load(std::memory_order_acquire) == n_ins) break;
                     continue;
@@ -200,10 +199,9 @@ static void t_concurrent_extract_min(const char* name,
 
     for (auto& th : ths) th.join();
 
-    // Drain remainder
     std::vector<long> all;
     for (auto& vec : extracted) all.insert(all.end(), vec.begin(), vec.end());
-    { long v; while ((v = s.extract_min()) != NO_KEY) all.push_back(v); }
+    { long v; while ((v = s.extract_min(0)) != NO_KEY) all.push_back(v); }
     std::sort(all.begin(), all.end());
 
     assert((int)all.size() == total);
@@ -217,23 +215,25 @@ static void t_concurrent_extract_max(const char* name,
                                      int n_ins = 4, int n_ext = 4,
                                      int per = 500) {
     int total = n_ins * per;
-    S s;
+    int n_threads = n_ins + n_ext;
+    S s(n_threads);
     std::atomic<int> ins_done{0};
     std::vector<std::vector<long>> extracted(n_ext);
 
     std::vector<std::thread> ths;
-    ths.reserve(n_ins + n_ext);
+    ths.reserve(n_threads);
 
     for (int t = 0; t < n_ins; ++t)
         ths.emplace_back([&, t]() {
-            for (int i = 0; i < per; ++i) s.insert(t * per + i);
+            for (int i = 0; i < per; ++i) s.insert(t, t * per + i);
             ins_done.fetch_add(1, std::memory_order_release);
         });
 
     for (int t = 0; t < n_ext; ++t)
         ths.emplace_back([&, t]() {
+            int my_tid = n_ins + t;
             while (true) {
-                long v = s.extract_max();
+                long v = s.extract_max(my_tid);
                 if (v == NO_KEY) {
                     if (ins_done.load(std::memory_order_acquire) == n_ins) break;
                     continue;
@@ -246,7 +246,7 @@ static void t_concurrent_extract_max(const char* name,
 
     std::vector<long> all;
     for (auto& vec : extracted) all.insert(all.end(), vec.begin(), vec.end());
-    { long v; while ((v = s.extract_max()) != NO_KEY) all.push_back(v); }
+    { long v; while ((v = s.extract_max(0)) != NO_KEY) all.push_back(v); }
     std::sort(all.begin(), all.end());
 
     assert((int)all.size() == total);
@@ -258,7 +258,7 @@ static void t_concurrent_extract_max(const char* name,
 template <class S>
 static void t_concurrent_mixed(const char* name, int n_threads = 8) {
     constexpr int OPS = 1000, KEY_RANGE = 64;
-    S s;
+    S s(n_threads);
     std::vector<long> emin_keys, emax_keys;
     std::mutex mu;
 
@@ -269,10 +269,10 @@ static void t_concurrent_mixed(const char* name, int n_threads = 8) {
         for (int i = 0; i < OPS; ++i) {
             int key = kd(rng), op = od(rng);
             switch (op) {
-                case 0: s.insert(key);    break;
-                case 1: s.remove(key);    break;
-                case 2: { long v = s.extract_min(); if (v != NO_KEY) lmin.push_back(v); break; }
-                case 3: { long v = s.extract_max(); if (v != NO_KEY) lmax.push_back(v); break; }
+                case 0: s.insert(tid, key);    break;
+                case 1: s.remove(tid, key);    break;
+                case 2: { long v = s.extract_min(tid); if (v != NO_KEY) lmin.push_back(v); break; }
+                case 3: { long v = s.extract_max(tid); if (v != NO_KEY) lmax.push_back(v); break; }
             }
         }
         std::lock_guard<std::mutex> lk(mu);
@@ -297,11 +297,11 @@ static void t_concurrent_mixed(const char* name, int n_threads = 8) {
 template <class S>
 static void t_high_thread_stress(const char* name) {
     constexpr int N = 32, PER = 500;
-    S s;
+    S s(N);
     auto worker = [&](int tid) {
         int base = tid * PER;
-        for (int i = 0; i < PER; ++i) s.insert(base + i);
-        for (int i = 0; i < PER; ++i) s.remove(base + i);
+        for (int i = 0; i < PER; ++i) s.insert(tid, base + i);
+        for (int i = 0; i < PER; ++i) s.remove(tid, base + i);
     };
     std::vector<std::thread> ths;
     ths.reserve(N);

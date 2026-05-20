@@ -1,22 +1,21 @@
 #pragma once
-#include "node.h"
+#include "debra.h"
 #include "bst_hint.h"
 #include "list_pragmatic.h"
 
-// BSTListPragmatic: ordered set backed by a lock-free doubly-linked list with
-// an unbalanced BST hint index.
-//
-// Identical public API to BSTList but uses the pragmatic prev_-maintenance
-// strategy (plain atomic stores, no CAS barriers) from list_pragmatic.h.
-// The unbalanced hint BST is the same Natarajan-Mittal tree as in bst_list.h.
+// BSTListPragmatic: BST hint + pragmatic (plain-store prev_) doubly-linked list.
+// Memory reclamation: DEBRA epoch-based (Trevor Brown, PODC 2015).
 
 class BSTListPragmatic {
     Node* head_;
     Node* tail_;
     bst_hint::HintBST bst_;
+    Debra debra_;
 
 public:
-    BSTListPragmatic() {
+    explicit BSTListPragmatic(int num_threads = DEBRA_MAX_THREADS)
+        : debra_(num_threads)
+    {
         head_ = new Node(KEY_MIN);
         tail_ = new Node(KEY_MAX);
 
@@ -30,45 +29,52 @@ public:
     ~BSTListPragmatic() {
         Node* cur = head_;
         while (cur != nullptr) {
-            MarkedPtr nw = read_next(cur);
-            Node* next   = nw.ptr_;
-            bool is_tail = (cur == tail_);
-            CollisionlessPtr cp = read_prev(cur);
-            if (cp) delete cp;
+            Node* next = read_next(cur).ptr_;
+            CollisionlessPtr pw = cur->prev_.load(std::memory_order_relaxed);
+            if (pw) delete pw;
             delete cur;
-            if (is_tail) break;
+            if (cur == tail_) break;
             cur = next;
         }
     }
 
-    // Insert key. Returns true if inserted, false if already present.
-    bool insert(long key) {
-        Node* hint = bst_.find_close(key);
-        bool ok = list_insert_p(head_, tail_, hint, key);
+    bool insert(int tid, long key) {
+        debra_.leaveQuiescentState(tid);
+        Node* hint     = bst_.find_close(key);
+        Node* new_node = debra_.allocNode(tid, key);
+        bool ok = list_insert_p(head_, tail_, hint, key, new_node, &debra_, tid);
         if (ok) {
             NodeSnapshot pred, curr;
-            list_find_p(head_, hint, key, &pred, &curr);
+            list_find_p(head_, hint, key, &pred, &curr, &debra_, tid);
             if (curr.self_->key_ == key)
                 bst_.try_set(key, curr.self_);
         }
+        debra_.enterQuiescentState(tid);
         return ok;
     }
 
-    // Remove key. Returns true if this call performed the logical deletion.
-    bool remove(long key) {
+    bool remove(int tid, long key) {
+        debra_.leaveQuiescentState(tid);
         Node* hint = bst_.find_close(key);
-        return list_erase_p(head_, hint, key);
+        bool ok = list_erase_p(head_, hint, key, &debra_, tid);
+        debra_.enterQuiescentState(tid);
+        return ok;
     }
 
-    // Return the minimum key, or NO_KEY if the set is empty.
     long min() const { return list_min_p(head_, tail_); }
-
-    // Return the maximum key, or NO_KEY if the set is empty.
     long max() const { return list_max_p(head_, tail_); }
 
-    // Remove and return the minimum key, or NO_KEY if the set is empty.
-    long extract_min() { return list_extract_min_p(head_, tail_); }
+    long extract_min(int tid) {
+        debra_.leaveQuiescentState(tid);
+        long v = list_extract_min_p(head_, tail_, &debra_, tid);
+        debra_.enterQuiescentState(tid);
+        return v;
+    }
 
-    // Remove and return the maximum key, or NO_KEY if the set is empty.
-    long extract_max() { return list_extract_max_p(head_, tail_); }
+    long extract_max(int tid) {
+        debra_.leaveQuiescentState(tid);
+        long v = list_extract_max_p(head_, tail_, &debra_, tid);
+        debra_.enterQuiescentState(tid);
+        return v;
+    }
 };
