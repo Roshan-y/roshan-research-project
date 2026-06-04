@@ -10,13 +10,59 @@ linked list. The BST is a hint index whose only job is `find_close(key) → Node
 
 ```
 implementation/
-├── node.h            Core types: State, MarkedPtr, CollisionlessPtr, Node, NodeSnapshot
-├── list.h            Lock-free doubly-linked list (barrier, normalize, insert, erase, min, max, extractMin, extractMax)
-├── bst_hint.h        Lock-free external BST hint index (Natarajan-Mittal, adapted)
-└── bst_list.h        BSTList class — public API combining list + BST
+├── node.h                    Core types: State, MarkedPtr, CollisionlessPtr, Node, NodeSnapshot
+├── list.h                    Lock-free doubly-linked list (barrier, normalize, insert, erase, min, max, extractMin, extractMax)
+├── list_pragmatic.h          Pragmatic list variant with plain prev stores
+├── bst_hint.h                Lock-free external BST hint index (Natarajan-Mittal, adapted)
+├── bst_balanced_hint.h       Balanced hint index based on CBAT / chromatic tree
+├── bst_list*.h               Four wrappers combining the list and BST variants
 ```
 
-Build: `g++-14 -std=c++17 -O2 -pthread -o test test.cpp`
+Build: `g++ -std=c++17 -O2 -pthread -o bench bench.cpp && ./bench`
+
+---
+
+## Benchmark results (lpdquad, g++ -O2, DEBRA active)
+
+### Per-operation throughput (8 threads, key range 10,000, Mops/s)
+
+| Variant | insert | remove | min+max | extract\_min | extract\_max |
+|---|---|---|---|---|---|
+| BSTList | **0.053** | **0.050** | 24.972 | 1.367 | **1.602** |
+| BSTListBalanced | 0.038 | 0.024 | 25.721 | 0.227 | 0.225 |
+| BSTListPragmatic | 0.043 | 0.032 | 26.429 | **1.396** | 1.064 |
+| BSTListBalancedPragmatic | 0.038 | 0.023 | **27.974** | 0.239 | 0.253 |
+
+`extract_min` / `extract_max` are much faster than insert/remove because: (a) each
+extraction only needs to find the head/tail node (O(1) once the victim is stamped), and
+(b) extract operations spend most of their time in the DEBRA CS not doing list traversal.
+
+`min+max` is fast: `list_max_backward` walks backward from `tail->prev_` inside a DEBRA
+critical section, making `max()` O(1) amortized. The store-based variants keep
+back-pointers more current than the barrier variant, directly benefiting the backward scan.
+Note: `min+max` throughput is highly sensitive to server memory-bandwidth availability and
+varies significantly across runs on the shared `lpdquad` server.
+
+The balanced BST variants are significantly slower: chromatic-tree LLX/SCX rebalancing
+overhead dominates extract\_min/extract\_max cost.
+
+### Mixed throughput (Mops/s, 40% insert / 40% remove / 20% min+max)
+
+Key range 1,000:
+
+| Threads | BSTList | BSTListBalanced | BSTListPragmatic | BSTListBalancedPragmatic |
+|---|---|---|---|---|
+| 1  | **0.777** | 0.356 | 0.709 | 0.333 |
+| 8  | 3.969 | 0.487 | **4.406** | 0.596 |
+| 32 | **5.606** | 0.273 | 5.322 | 0.265 |
+
+Key range 10,000:
+
+| Threads | BSTList | BSTListBalanced | BSTListPragmatic | BSTListBalancedPragmatic |
+|---|---|---|---|---|
+| 1  | **0.041** | 0.026 | 0.039 | 0.025 |
+| 8  | **0.255** | 0.156 | 0.251 | 0.156 |
+| 32 | 0.850 | 0.191 | **0.887** | 0.220 |
 
 ---
 
@@ -30,16 +76,19 @@ with approximate backward `prev_` pointers maintained alongside.
 
 ### State / MarkedPtr
 
-Each node's `next_` field encodes both the successor pointer and a one-bit state:
+Each node's `next_` field encodes both the successor pointer and a 2-bit state:
 
 ```
-State ∈ { Ok, Deleted }
+State ∈ { Ok, Deleted, ExtMin, ExtMax }
   Ok      — node is logically present in the set
-  Deleted — node is logically removed (immutable from this point)
+  Deleted — node is logically removed by remove()
+  ExtMin  — node is claimed by extract_min()
+  ExtMax  — node is claimed by extract_max()
 ```
 
-Deletion is a one-way transition: once `Deleted`, a node's `next_` and `state` never
-change. This is Harris's singly-linked-list mark, packed into the low bit of `next_`.
+Deletion is a one-way transition for the logical set state: once a node is marked
+`Deleted`, `ExtMin`, or `ExtMax`, the node is treated as removed from the set. The
+forward pointer is still used for traversal and helping.
 
 ### CollisionlessPtr
 
@@ -48,7 +97,8 @@ pointer was replaced and restored between the read and the CAS. To prevent this,
 write of `prev_` allocates a new `PrevWrapper` heap object containing the target `Node*`.
 Two writes of the same node produce different wrapper addresses, so any CAS on
 `CollisionlessPtr` that sees the same address knows the value truly has not changed.
-Old wrappers are leaked (no reclamation — safe since addresses are never reused).
+Failed `PrevWrapper` allocations are deleted immediately; wrappers that are later
+superseded by new writes are not reclaimed during normal execution.
 
 ```
 CollisionlessPtr = PrevWrapper*       // pointer to heap object { Node* node }
@@ -130,32 +180,28 @@ deleted in the process.
 ## Pseudocode: list_find
 
 `list_find` is the shared traversal routine used by insert, remove, and the extract
-operations. It starts from the BST hint (or falls back to `head`) and first walks
-backward via `prev_` pointers to find a living node whose key is strictly below the
-target — this keeps retries local instead of always restarting from `head`. It then
-walks forward, evicting any logically deleted nodes it encounters along the way, until
-it brackets the target key between two live nodes `pred` and `curr`. If at any point
-`pred` itself becomes deleted during the forward walk, the whole process restarts from
-a fresh backward search near that position.
+operations. It starts from the BST hint when the hint lies strictly before the target
+key; otherwise it falls back to `head`. From there it walks forward, evicting any
+logically deleted nodes it encounters along the way, until it brackets the target key
+between two live nodes `pred` and `curr`. If `pred` becomes deleted or normalization
+fails, the traversal restarts from `head`.
 
 ```
 list_find(head, hint, key) → (pred, curr):
 
-  start = find_living_backward(hint, key, head)
-  // find_living_backward walks backward up to 64 steps via prev_ until it finds
-  // a living node with key < target; falls back to head if none found.
+  start = hint if hint != null and hint != head and hint.key < key else head
 
   retry:
     pred = take_snapshot(start)
 
     while true:
       if pred.state == Deleted:
-        start = find_living_backward(pred.self_, key, head)
+        start = head
         goto retry
 
       curr = take_snapshot(pred.next.ptr)
       if not normalize_next_node(pred, curr):  // evict deleted nodes after pred
-        start = find_living_backward(pred.self_, key, head)
+        start = head
         goto retry
 
       if curr.self_.key >= key:
@@ -228,12 +274,23 @@ flips the node's state from `Ok` to `Deleted` in its `next_` field — and then 
 best-effort physical removal that unlinks the now-dead node from the list. The logical
 deletion CAS is the only step that matters for correctness; the physical removal is
 cooperative and can be completed by any thread that later traverses past the deleted
-node. The BST hint index is intentionally not updated on deletion to avoid a race with
-concurrent re-insertions of the same key.
+node. After successful logical deletion, `bst.remove(key)` nulls the hint entry. The
+call is unconditional (even when the key is absent) to handle a race: a concurrent
+`insert(key)` may call `try_set` after the remover checks the list but before it nulls
+the hint, leaving a stale pointer. Calling `bst.remove` unconditionally closes that window.
 
 ```
 remove(key):
   hint = bst.find_close(key)
+  ok = list_erase(head, hint, key)
+  bst.remove(key)           // null hint whether or not key was found
+  return ok
+```
+
+`list_erase` (expanded):
+
+```
+list_erase(head, hint, key):
   start = hint
 
   loop:
@@ -251,7 +308,6 @@ remove(key):
 
     // Logical deletion succeeded. Best-effort physical removal:
     help_deleted_next(pred, curr)
-    // (barriers + cas_next(pred, pred.next, {next.ptr, Ok}) + post_evict_fix)
     return true
 
   retry:
@@ -295,45 +351,36 @@ min() → key | NO_KEY:
 
 ## Pseudocode: max
 
-`max` uses `tail.prev_` as a backward hint to avoid scanning the entire list. It first
-walks backward past any deleted nodes to find a reasonable starting point near the end,
-then does a definitive forward scan all the way to `tail`, tracking the last live node
-it sees. The backward step is just an optimisation; the forward scan to `tail` is
-mandatory to ensure correctness — a node inserted after the hint but before `tail`
-must not be missed. The key recorded during the last live node read before reaching
-`tail` is the returned maximum.
+`max(tid)` walks backward from `tail->prev_` inside a DEBRA critical section.
+DEBRA guarantees that `prev_` pointers are not freed while the thread holds the CS,
+making this O(1) amortized (typical case: `tail->prev_` already points at the maximum,
+so the loop terminates immediately).
 
 ```
-max() → key | NO_KEY:
-  // Use tail.prev_ as a backward hint to start close to the end.
-  start = unwrap(tail.prev_)
-  if start == null: start = head
+max(tid) → key | NO_KEY:
+  DEBRA.leaveQuiescentState(tid)       // enter critical section
 
-  // Walk backward (up to 64 steps) past any deleted nodes.
-  for i in 0..64:
-    if start == head: break
-    if start.next.state == Ok: break
-    pp = unwrap(start.prev_)
-    if pp == null or pp == start: start = head; break
-    start = pp
+  node = unwrap(tail.prev_)
+  while node ≠ null and node ≠ head:
+    if node.next.state == Ok:
+      DEBRA.enterQuiescentState(tid)
+      return node.key                  // [LP — this read]
+    node = unwrap(node.prev_)
 
-  // Forward scan from start to tail; track the last alive node.
-  last_key = NO_KEY
-  node = (start == head) ? head.next.ptr : start
-
-  while node ≠ tail:
-    (succ, state) = node.next
-    if state == Ok:
-      last_key = node.key        // [LP — last such read before reaching tail]
-    node = succ
-
-  return last_key
+  DEBRA.enterQuiescentState(tid)
+  return NO_KEY
 ```
 
-**Linearization point**: the final read of `node.next` that reveals `state == Ok` and
-updates `last_key` to the returned value. The forward scan to `tail` ensures we do not
-miss any node inserted after the backward hint. If no alive node is found, the LP is
-the pointer advance that first makes `node == tail`.
+**Linearization point**: the read of `node.next` that reveals `state == Ok`, returning
+`node.key`. The backward walk terminates as soon as the first live node is found from
+the tail end, which is the current maximum. If the whole list is empty (only sentinels
+reachable), NO_KEY is returned; the LP is the last `node.prev_` read that exhausts the
+backward chain.
+
+**Why DEBRA is required**: `prev_` pointers may point to nodes that have been logically
+deleted and retired to DEBRA bags, but not yet freed. Reading `node.prev_` on such a node
+is safe only while inside a critical section — DEBRA prevents draining a bag while any
+thread is in a CS.
 
 ---
 
@@ -401,18 +448,18 @@ helpExtMin():
     // ── ExtMin already set: advance head past victim ─────────────────────
     if vstate == ExtMin:
       succ = victim.next.ptr   // re-read for fresh successor pointer
-      snap_head   = take_snapshot(head)
-      snap_victim = take_snapshot(victim)
-      snap_vsucc  = take_snapshot(succ)   // skipped if succ == null
-      barrier(snap_head)
-      barrier(snap_victim, snap_head)
-      if succ ≠ null: barrier(snap_vsucc, snap_victim)
+      // No barrier() calls here — they caused livelock under high contention:
+      // 8 threads simultaneously fixing prev_ each invalidate the others'
+      // snapshot anchors, so no thread makes progress.
       // Epoch guard: only advance head if still in the epoch started with 'first'.
       // Prevents a stale helper from clobbering a newer concurrent epoch.
       (hptr, hst) = head.next
       if hst == EXT_MIN and hptr == first:
-        head.next.CAS((hptr, EXT_MIN), (succ, Ok))
-      post_evict_fix(snap_head, snap_victim)
+        if head.next.CAS((hptr, EXT_MIN), (succ, Ok)):
+          retire(victim)
+      // Single non-retrying prev_ fix. If it loses the race,
+      // the next barrier() from any insert/remove will repair it.
+      if succ ≠ null: cas_prev(succ, succ.prev_, head)
       continue
 
     // ── Ok: try to stamp victim ──────────────────────────────────────────
@@ -751,92 +798,113 @@ naturally rescans to the new maximum. No `tail_anchor` epoch, no `helpExtMax`, a
 gating of tail inserts is required.
 
 Two concurrent `extractMax` calls can safely race: both try
-`victim.next.CAS({tail, CLEAR}, {tail, MARKED_EXT_MAX})` — exactly one wins (the LP),
-the other sees `MARKED_EXT_MAX` on the victim and returns the same key. Physical
-removal still requires finding the predecessor via `prev_` hints and running the three
-DLL barriers, but that is unavoidable in a doubly-linked list regardless of the epoch
-design.
+`victim.next.CAS({tail, Ok}, {tail, ExtMax})` — exactly one wins (the LP),
+the other sees `ExtMax` on the victim and rescans. Physical removal requires finding
+the predecessor, which is done by reading `victim.prev_` as a start hint and walking
+forward. No `barrier()` CAS calls on `prev_` are made during that traversal — those
+caused livelock under high contention. The post-splice back-pointer repair uses a
+single non-retrying update. Reading `prev_` for traversal is safe inside a DEBRA
+critical section.
 
 ```
 extractMax() → key | EMPTY:
   while true:
 
-    // ── Find last Ok node ────────────────────────────────────────────────
-    // Walk backward from tail.prev_ hint past logically removed nodes, then
-    // scan forward all the way to tail tracking the last Ok node seen.
-    start = unwrap(tail.prev_)
-    if start == null: start = head
-
-    for i in 0..64:
-      if start == head: break
-      if start.next.state == Ok: break
-      pp = unwrap(start.prev_)
-      if pp == null or pp == start: start = head; break
-      start = pp
+    // ── Phase 1: backward hint + forward scan to find last Ok node ───────
+    // Read tail.prev_ and walk backward up to 64 steps until we land on an
+    // Ok node (bstart).  This gives a start point near the maximum; fall
+    // back to head if prev_ is stale or points only to deleted nodes.
+    // Only READS of prev_ — no CAS on prev_ (barrier() CAS caused livelock
+    // under high contention).  Safe to dereference inside a DEBRA CS.
+    bstart = unwrap(tail.prev_)
+    if bstart ≠ null and bstart ≠ head:
+      for i in 0..64:
+        if bstart.next.state == Ok: break
+        pp = unwrap(bstart.prev_)
+        if pp == null or pp == bstart or pp == head: bstart = null; break
+        bstart = pp
+      if bstart ≠ null and bstart.next.state ≠ Ok: bstart = null
+    else:
+      bstart = null
 
     victim = null
-    scan = (start == head) ? head.next.ptr : start
+    scan = bstart if bstart ≠ null else head.next.ptr
     while scan ≠ tail:
       (ssucc, sstate) = scan.next
 
       if sstate == ExtMax:
-        // Another extractMax already claimed this node.
-        // Help physically remove it, then return its key.
-        pred = unwrap(read_prev(scan)) or head
-        snap_pred = take_snapshot(pred)
-        snap_scan = take_snapshot(scan)
-        snap_succ = take_snapshot(ssucc)
-        if barrier(snap_pred) and barrier(snap_scan, snap_pred)
-                              and barrier(snap_succ, snap_pred):
-          if snap_pred.next == {scan, Ok}:
-            cas_next(pred, snap_pred.next, {ssucc, Ok})
-          post_evict_fix(snap_pred, snap_scan)
-        return scan.key        // [LP — the CAS that stamped ExtMax]
+        // Help physically remove an already-claimed ExtMax node.
+        // Walk forward from head to find its predecessor; no barrier() calls.
+        pred = head
+        while true:
+          pnw = pred.next
+          if pnw.ptr == scan: break
+          if pnw.state ≠ Ok or pnw.ptr == null or pnw.ptr.key > scan.key:
+            pred = head; break
+          pred = pnw.ptr
+        if pred.next == {scan, Ok}:
+          cas_next(pred, {scan, Ok}, {ssucc, Ok})
+          fix ssucc.prev_ ← pred
+        scan = ssucc
+        continue
 
       if sstate == Ok: victim = scan
       scan = ssucc
 
     if victim == null:
-      return EMPTY             // no Ok node found; set is empty [LP — this read]
+      return EMPTY             // set is empty [LP — the read of scan == tail with no Ok node found]
 
-    // ── Verify victim is still the maximum and stamp ExtMax ─────────────
+    // ── Phase 2: verify victim is still the maximum and stamp ExtMax ─────
     (vsucc, vstate) = victim.next
     if vsucc ≠ tail or vstate ≠ Ok:
-      continue                 // new node inserted after victim, or already removed
+      // Optimization: if vstate == Ok but vsucc ≠ tail, the node between
+      // victim and tail may already be an ExtMax node claimed by another
+      // thread. In that case we can directly CAS victim.next to skip it,
+      // letting the owner of that ExtMax node retire it later.  This avoids
+      // a forward walk from head just to help remove the stuck node.
+      // (Implemented as the "vmpfail-escape" path in list.h / list_pragmatic.h.)
+      continue                 // new node inserted after victim, or victim removed
 
     if not victim.next.CAS({tail, Ok}, {tail, ExtMax}):  // [LP]
       continue                 // lost race; rescan
 
-    // ── Physical removal ──────────────────────────────────────────────────
-    // Locate predecessor: start from victim.prev_ and walk forward (up to 64
-    // steps) until pred.next.ptr == victim; fall back to head if not found.
-    // Then run three DLL barriers and CAS pred.next past victim.
+    // ── Phase 3: physical removal ─────────────────────────────────────────
+    // Use victim.prev_ as a start hint for the predecessor walk; fall back
+    // to head if the hint is invalid or deleted.  No CAS on prev_.
     while true:
-      pred = unwrap(read_prev(victim)) or head
-      for i in 0..64:
+      if head.next.state == ExtMin: helpExtMin()  // avoid deadlock with extractMin
+
+      hint = unwrap(victim.prev_)
+      pred = hint if hint ≠ null and hint ≠ head and hint ≠ victim
+                 and hint.key < victim.key and hint.next.state == Ok
+             else head
+      found_victim   = false
+      victim_removed = false
+      while true:
         pnw = pred.next
-        if pnw.ptr == victim: break
-        if pnw.state ≠ Ok or pnw.ptr == null or pnw.ptr.key > victim.key:
-          pred = head; break
+        if pnw.ptr == null: pred = head; break
+        // key-order check first: another thread may have removed victim and
+        // inserted a new Ok node with a larger key — that's the victim_removed case.
+        if pnw.ptr.key > victim.key: victim_removed = true; break
+        if pnw.ptr == victim and pnw.state == Ok: found_victim = true; break
+        if pnw.state ≠ Ok: pred = head; break
         pred = pnw.ptr
 
-      snap_pred   = take_snapshot(pred)
-      snap_victim = take_snapshot(victim)   // (tail, ExtMax)
-      snap_vsucc  = take_snapshot(tail)
+      if victim_removed:
+        retire(victim)         // we own victim; another thread already unlinked it
+        return victim.key
 
-      if not barrier(snap_pred): continue
-      if not barrier(snap_victim, snap_pred): continue
-      barrier(snap_vsucc, snap_victim)
+      if not found_victim: continue
 
-      // Guard: pred must currently point to victim with Ok state.
-      if snap_pred.next ≠ {victim, Ok}: continue
+      if pred.next ≠ {victim, Ok}: continue
 
-      if cas_next(pred, snap_pred.next, {tail, Ok}):
-        post_evict_fix(snap_pred, snap_victim)   // fix tail.prev_ if → victim
+      if cas_next(pred, {victim, Ok}, {tail, Ok}):
+        fix tail.prev_ ← pred
+        retire(victim)
         return victim.key
 ```
 
-**Linearization point**: the successful `victim.next.CAS({tail, CLEAR}, {tail, MARKED_EXT_MAX})`.
+**Linearization point**: the successful `victim.next.CAS({tail, Ok}, {tail, ExtMax})`.
 At that instant `victim.key` equals `max(S)` — verified by the fact that `victim.next.ptr == tail`
 in the CAS expected value, meaning no node with a larger key exists in the list.
 
@@ -891,10 +959,10 @@ constitute a LP.
 
 | Outcome | LP | Thread | Pre-condition | Post-condition |
 |---|---|---|---|---|
-| Success — calling thread marks victim | `victim.next.CAS((vsucc,CLEAR),(vsucc,MARKED_EXT_MIN))` in extractMin inner loop | Calling thread | S ≠ ∅; victim.key = min(S) | S \ {victim.key} |
-| Success — helper marks victim | `victim.next.CAS((vsucc,CLEAR),(vsucc,MARKED_EXT_MIN))` in helpExtMin | Helper thread | S ≠ ∅; victim.key = min(S) | S \ {victim.key} |
-| Returns EMPTY — calling thread clears | `head.next.CAS((hptr,EXT_MIN),(tail,CLEAR))` when victim == tail | Calling thread | S = ∅ | S = ∅ |
-| Returns EMPTY — helper clears | `head.next.CAS((hptr,EXT_MIN),(tail,CLEAR))` in helpExtMin | Helper thread | S = ∅ | S = ∅ |
+| Success — calling thread marks victim | `victim.next.CAS((vsucc,Ok),(vsucc,ExtMin))` in extractMin inner loop | Calling thread | S ≠ ∅; victim.key = min(S) | S \ {victim.key} |
+| Success — helper marks victim | `victim.next.CAS((vsucc,Ok),(vsucc,ExtMin))` in helpExtMin | Helper thread | S ≠ ∅; victim.key = min(S) | S \ {victim.key} |
+| Returns EMPTY — calling thread clears | `head.next.CAS((hptr,ExtMin),(tail,Ok))` when victim == tail | Calling thread | S = ∅ | S = ∅ |
+| Returns EMPTY — helper clears | `head.next.CAS((hptr,ExtMin),(tail,Ok))` in helpExtMin | Helper thread | S = ∅ | S = ∅ |
 
 *LP ownership*: the LP belongs to whichever thread executes the winning
 `victim.next.CAS`. At most one `MARKED_EXT_MIN` node exists per epoch.
@@ -911,57 +979,252 @@ strictly before or strictly after the `extractMin` LP — never concurrently.
 
 ### extractMax
 
+The implemented simplified (no-epoch) extractMax has no helper thread and no `tail_anchor`.
+
 | Outcome | LP | Thread | Pre-condition | Post-condition |
 |---|---|---|---|---|
-| Success — calling thread marks victim | `victim.next.CAS((vsucc,CLEAR),(vsucc,MARKED_EXT_MAX))` in extractMax inner loop | Calling thread | S ≠ ∅; victim.key = max(S) | S \ {victim.key} |
-| Success — helper marks victim | `victim.next.CAS((vsucc,CLEAR),(vsucc,MARKED_EXT_MAX))` in helpExtMax | Helper thread | S ≠ ∅; victim.key = max(S) | S \ {victim.key} |
-| Returns EMPTY — calling thread clears | `tail_anchor.CAS((lptr,EXT_MAX),(lptr,IDLE))` when no CLEAR node found | Calling thread | S = ∅ | S = ∅ |
-| Returns EMPTY — helper clears | `tail_anchor.CAS((lptr,EXT_MAX),(lptr,IDLE))` in helpExtMax | Helper thread | S = ∅ | S = ∅ |
+| Success | `victim.next.CAS((tail,Ok),(tail,ExtMax))` | Calling thread | S ≠ ∅; victim.key = max(S); victim.next.ptr == tail | S \ {victim.key} |
+| Returns EMPTY | The read `victim == null` after the forward scan finds no Ok node | Calling thread | S = ∅ | S = ∅ |
 
 *LP ownership*: symmetric to extractMin. The physical removal `cas_next(pred, pred.next,
 {vsucc,Ok})` is not a LP.
 
 *DLL asymmetry*: unlike extractMin (where the head-advance targets `head.next`),
 the physical removal for extractMax targets `pred.next` — an interior pointer —
-because the maximum is an arbitrary node, not the first after head. The barriers and
-`locate_pred` walk are the mechanism for finding and stabilising that interior
-predecessor before the CAS.
+because the maximum is an arbitrary node, not the first after head. The `victim.prev_`
+hint and forward walk are used to locate the predecessor before the physical-removal CAS.
 
 *extractMin vs extractMax when |S| = 1*: if the same node is both min and max,
 the two `victim.next.CAS` operations race. Exactly one wins. The loser rescans,
-finds the set empty (reaches `tail` / no CLEAR node), and returns EMPTY with LP
-at the appropriate epoch-clearing CAS.
+finds the set empty (no Ok node in Phase 1), and returns EMPTY.
 
-*Concurrent insert at tail*: while `EXT_MAX` is set, a tail insert checks
-`tail_anchor.state` and calls `helpExtMax` before retrying. The insert LP falls
-strictly before or strictly after the `extractMax` LP — never concurrently.
-
----
-
-## BST hint index (bst_hint.h)
-
-Adapted from Natarajan-Mittal external lock-free BST. Leaf nodes carry a `list_ptr`
-pointing to the corresponding list `Node`. `find_close(key)` descends to a leaf and
-returns its `list_ptr`. `try_set(key, node*)` is called after a successful list insertion.
-`try_remove` is intentionally not called on list deletion to avoid a race where a
-concurrent re-insertion's BST entry would be silently removed.
+*Concurrent insert at tail*: a concurrent insert of a new maximum changes
+`victim.next` away from `tail`, causing the stamp CAS to fail. The insert LP
+and the (failed) stamp CAS are serialized by `victim.next`: either the insert
+succeeds first (stamp CAS sees wrong expected value, rescan finds new maximum)
+or the stamp CAS wins first (insert's CAS on pred.next fails, insert retries).
 
 ---
 
-## Memory reclamation
+## BST hint index (bst_hint.h and bst_balanced_hint.h)
 
-Nodes removed from the list and BST are not freed. `PrevWrapper` objects are created on
-every back-pointer update and also not freed. This is safe for correctness without ABA
-protection because node addresses are never reused. A production version needs
-epoch-based or hazard-pointer reclamation before either `list_find` or `find_close` can
-safely dereference a pointer that another thread might concurrently free.
+Two BST hint implementations are provided:
+
+- **HintBST** (`bst_hint.h`): adapted from the Natarajan-Mittal external lock-free BST.
+  Uses DEBRA epoch-based retirement for BST nodes (same DEBRA instance as the list layer).
+  When `remove(key, debra, tid)` commits a deletion (wins the FLAG_BIT CAS on the parent's
+  child pointer), it retires **both** the leaf node and the spliced-out parent (internal)
+  node via `debra.retireRaw`. Retiring only the leaf was unsafe: the parent persisted
+  in memory (via `alloc_head_`) and still held a stale child pointer to the retired leaf,
+  allowing `find_close` to reach a freed leaf through the live parent — heap-use-after-free.
+  Retiring both together is safe because `find_close` and all BST operations run inside a
+  DEBRA critical section, so DEBRA guarantees neither node is freed while any thread holds
+  a pointer obtained during its current CS.
+  At shutdown: `~HintBST` walks the live tree (`free_live_nodes`) to delete all nodes
+  still reachable from the root. DEBRA-retired (spliced-out) nodes are not reachable from
+  the root and are freed by `~Debra()`. No overlap, no double-free.
+
+- **BalancedHintBST** (`bst_balanced_hint.h`): adapted from Brown's chromatic tree
+  (PPoPP 2014). Uses LLX/SCX primitives to rebalance after inserts and removals.
+  All `BSTNodeC` and `SCXRecC` objects are tracked via intrusive lists (`alloc_head_` and
+  `alloc_recs_`) and freed in bulk by `~BalancedHintBST()`. No runtime DEBRA retirement
+  for tree nodes.
+
+Both share the same logical interface, but `remove` signatures differ:
+- `find_close(key)` — descend to a leaf and return its `list_ptr`. Read-only; no LLX.
+- `try_set(key, node*)` — insert or update the leaf for `key` to point to `node`.
+  Called by the inserter after a successful `list_insert`.
+- `remove(key, debra, tid)` (`HintBST`) / `remove(key)` (`BalancedHintBST`) — null the
+  leaf's `list_ptr` and splice it from the tree.
+  Called by the remover/extractor to prevent `find_close` from returning a stale hint.
+
+### BST hint lifecycle and ordering discipline
+
+The BST hint layer is advisory. Correctness of the ordered set depends only on the list;
+the BST only affects traversal start position. However, the hint's `list_ptr` must not
+point to a freed list node, because `find_close` is called at the start of each
+operation and the returned pointer is dereferenced inside a DEBRA critical section.
+
+**Safe ordering in `remove(key)`**:
+
+```
+// Wrong: bst.remove nulls hint before list_erase retires the node.
+// A concurrent insert's try_set then re-populates the hint between
+// bst.remove and list_erase, and the insert guard may see state=Ok
+// (list_erase hasn't marked the node Deleted yet), leaving the hint
+// pointing to a node that will soon be retired and freed.
+
+// Correct:
+hint = bst.find_close(key)
+ok   = list_erase(key)        // marks node Deleted; retires it via DEBRA
+bst.remove(key)               // nulls hint AFTER retirement, still in CS
+```
+
+After `list_erase` marks the node Deleted, any concurrent inserter's guard sees
+`state != Ok` and calls `bst.remove` itself. The retired node cannot be freed until the
+retiring thread exits its critical section and two more epochs pass — by that point
+`bst.remove` has already been called, so the hint is null before the node is freed.
+
+**Safe ordering in `extract_min / extract_max`**:
+
+```
+v = list_extract_min()   // retires victim internally, still in CS
+bst.remove(v)            // nulls hint after retirement, still in CS
+```
+
+Same reasoning applies: the hint is nulled while the victim is still in the DEBRA bag
+(protected by the critical section). No thread can free the victim until after both the
+extractor's `enterQuiescentState` and two epoch advances, by which time the hint is null.
+
+**Insert guard**:
+
+After `list_insert` succeeds and `try_set` stores the new node in the BST, a concurrent
+remove may have already called `bst.remove(key)` (nulling the hint) and `list_erase`
+(marking the node Deleted) before the insert's `try_set` ran — re-populating the hint
+with a newly-retired node. The guard catches this:
+
+```
+ok = list_insert(key, new_node)
+if ok:
+    bst.try_set(key, new_node)
+    if read_next(new_node).state != Ok:   // node was removed while we were in try_set
+        bst.remove(key)                   // null the hint we just set
+```
+
+Because `new_node` is only marked `Deleted`/`ExtMin`/`ExtMax` after the CAS in
+`try_delete`/`extract_min`/`extract_max`, and DEBRA prevents the node from being freed
+while the inserter is still in its critical section, the guard can safely read
+`new_node.state` and call `bst.remove` if needed.
+
+### BalancedHintBST: leaf-sibling in update_erase
+
+When `update_erase` removes a leaf `l` with parent `p` and sibling `s`, it replaces `p`
+with a new node that absorbs both weights:
+
+```
+ns_new = make_int(s->key, p->weight + s->weight, sl, sr)
+```
+
+If `s` is itself a leaf, `sl = sr = nullptr`, and `make_int` produces an internal node
+with null children. When `update_rebalance` later traverses through `ns_new` and loads
+`ns_new->left = nullptr` into its loop variable `l`, the next iteration dereferences `l`
+→ null pointer dereference → SIGSEGV.
+
+Fix: when `s` is a leaf (detected by `sl == nullptr`), create a leaf instead:
+
+```cpp
+BSTNodeC* ns_new = (sl == nullptr)
+    ? make_leaf_w(s->key, nullptr, nw)   // leaf sibling; nullptr: don't copy s->list_ptr
+    : make_int(s->key, nw, sl, sr);      // internal sibling
+```
+
+`nullptr` is used for the new leaf's `list_ptr` (not `s->list_ptr`): `s->list_ptr` may
+point to a list node that was already retired and placed in a DEBRA bag; copying it
+would allow `find_close` to return a freed pointer after the next epoch drain.
+The new leaf `make_leaf_w` accepts an explicit weight so the coalesced weight `nw` is
+preserved. The BST is advisory so any temporary weight violation on the resulting leaf
+is harmless — `update_rebalance` returns early when it encounters a leaf.
+
+### BalancedHintBST: leaf-split race
+
+When `update_insert` splits a leaf `l` (key B) to make room for a new key A, it creates
+a new leaf for B to replace the old one:
+
+```
+// Incorrect: copies the old list_ptr; races with a concurrent remove(B)
+// that may have already nulled the old leaf's list_ptr and retired the node.
+cl = make_leaf(B, l.list_ptr.load())   // BUG: stale pointer copied to new leaf
+
+// Correct: the new leaf starts with a null hint for B.
+cl = make_leaf(B, nullptr)
+```
+
+If the old leaf's list_ptr is copied, a concurrent `remove(B)` that nulled the old
+leaf's pointer does not see the new leaf, so the new leaf retains the stale pointer even
+after the node is retired and freed. Using `nullptr` for the new leaf is safe because
+the BST is advisory: the hint for B will be null until the next insert of B calls
+`try_set`.
 
 ---
 
-## Open questions
+## Memory reclamation (DEBRA)
 
-- Add epoch-based reclamation so removed nodes and PrevWrappers are eventually freed.
-- Benchmark BST hint benefit: how much does `find_close(key)` vs always starting from
-  `head` reduce average traversal length?
-- Evaluate whether tree rebalancing (e.g., Drachsler's relaxed AVL rotations) is worth
-  the complexity for the hint layer.
+Memory reclamation uses **DEBRA** (Dynamically Escalating Barriers with Recorded
+Announcements), implemented in `debra.h` following Brown's PODC 2015 paper.
+
+### Design
+
+Each thread maintains three epoch bags. At the start of every operation a thread:
+1. Sets `in_cs[tid] = true` (seq-cst) to announce it is in a critical section.
+2. Reads the global epoch `ge` (seq-cst) and stores it in `thread_epoch[tid]`.
+3. Every `DEBRA_CHECK_FREQ` operations it calls `tryAdvanceEpoch`.
+
+`tryAdvanceEpoch` checks that every active thread (those with `in_cs=true`) has
+announced the current global epoch. If so, it advances the epoch by 2 and drains the
+bag that is 2 epochs old — freeing the nodes retired during that epoch.
+
+At the end of every operation the thread sets `in_cs[tid] = false`.
+
+### What is reclaimed
+
+- **List nodes** (`Node*`): retired by `evict_deleted` (for Deleted nodes),
+  `help_ext_min`/`list_extract_max` (for ExtMin/ExtMax nodes), via `debra.retireNode`.
+  Freed in `EpochBag::drain`. The drain loop also frees the live PrevWrapper still
+  stored in `prev_` at drain time (the one not yet superseded by a new write).
+
+- **PrevWrapper objects**: retired via `debra.retirePW` whenever a PrevWrapper is
+  replaced by a new one. In the barrier variant this happens inside `cas_prev`
+  (after a successful CAS). In the pragmatic variant it happens inside
+  `store_prev_direct` (after each plain exchange). Freed in `EpochBag::drain`.
+
+### Critical ordering: only retire Deleted nodes in evict_deleted
+
+`evict_deleted` physically removes a logically-deleted node from the list. It must only
+retire nodes with state `Deleted` — not `ExtMin` or `ExtMax`. Nodes in those states are
+owned by their extraction protocol; retiring them in `evict_deleted` too would cause a
+double-retire and eventual double-free:
+
+```cpp
+// In evict_deleted / evict_deleted_p:
+if (cas_next(prev, prev.next, {next.ptr, Ok})) {
+    if (current.marked_next.state == Deleted)   // ONLY Deleted
+        debra.retireNode(tid, current.self)
+    return true
+}
+```
+
+ExtMin/ExtMax nodes are always retired by their own extraction protocol after the
+head/pred advance CAS succeeds.
+
+### victim_removed path in extractMax
+
+When `list_extract_max` walks forward from head to physically remove the claimed victim
+(state ExtMax), it may find that another thread's `evict_deleted` has already unlinked
+the victim. In that case `victim_removed = true` and the extractor must still retire the
+victim (it won the stamp CAS and owns the node):
+
+```cpp
+if (victim_removed) {
+    debra.retireNode(tid, victim)
+    return victim.key
+}
+```
+
+Without this, the victim leaks (never freed).
+
+### in_cs announcement ordering
+
+The `in_cs[tid]` flag must be set to `true` **before** reading and announcing
+`thread_epoch[tid]`. If the order were reversed, another thread's `tryAdvanceEpoch`
+could see this thread as quiescent (in_cs=false), advance the epoch, and free a node
+that this thread is about to read. The seq-cst ordering on the `in_cs` store closes
+this window:
+
+```cpp
+void leaveQuiescentState(int tid) {
+    in_cs[tid].store(true, seq_cst);     // visible before epoch read
+    int ge = global_epoch.load(seq_cst); // read after in_cs is set
+    thread_epoch[tid].store(ge, release);
+    ...
+}
+```

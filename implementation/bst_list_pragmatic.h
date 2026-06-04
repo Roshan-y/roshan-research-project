@@ -9,8 +9,8 @@
 class BSTListPragmatic {
     Node* head_;
     Node* tail_;
-    bst_hint::HintBST bst_;
-    Debra debra_;
+    Debra             debra_;  // destroyed last (declared first)
+    bst_hint::HintBST bst_;   // destroyed first → sees debra_ still valid
 
 public:
     explicit BSTListPragmatic(int num_threads = DEBRA_MAX_THREADS)
@@ -44,10 +44,9 @@ public:
         Node* new_node = debra_.allocNode(tid, key);
         bool ok = list_insert_p(head_, tail_, hint, key, new_node, &debra_, tid);
         if (ok) {
-            NodeSnapshot pred, curr;
-            list_find_p(head_, hint, key, &pred, &curr, &debra_, tid);
-            if (curr.self_->key_ == key)
-                bst_.try_set(key, curr.self_);
+            bst_.try_set(key, new_node);
+            if (read_next(new_node).state_ != Ok)
+                bst_.remove(key, &debra_, tid);
         }
         debra_.enterQuiescentState(tid);
         return ok;
@@ -57,16 +56,23 @@ public:
         debra_.leaveQuiescentState(tid);
         Node* hint = bst_.find_close(key);
         bool ok = list_erase_p(head_, hint, key, &debra_, tid);
+        bst_.remove(key, &debra_, tid);  // see bst_list.h for the ordering rationale
         debra_.enterQuiescentState(tid);
         return ok;
     }
 
-    long min() const { return list_min_p(head_, tail_); }
-    long max() const { return list_max_p(head_, tail_); }
+    long min() const { return list_min(head_, tail_); }
+    long max(int tid) {
+        debra_.leaveQuiescentState(tid);
+        long v = list_max_backward(head_, tail_);
+        debra_.enterQuiescentState(tid);
+        return v;
+    }
 
     long extract_min(int tid) {
         debra_.leaveQuiescentState(tid);
         long v = list_extract_min_p(head_, tail_, &debra_, tid);
+        if (v != NO_KEY) bst_.remove(v, &debra_, tid);
         debra_.enterQuiescentState(tid);
         return v;
     }
@@ -74,6 +80,7 @@ public:
     long extract_max(int tid) {
         debra_.leaveQuiescentState(tid);
         long v = list_extract_max_p(head_, tail_, &debra_, tid);
+        if (v != NO_KEY) bst_.remove(v, &debra_, tid);
         debra_.enterQuiescentState(tid);
         return v;
     }
