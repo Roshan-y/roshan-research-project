@@ -15,10 +15,10 @@
 //   weight  > 1  →  overweight violation (introduced by insert, fixed lazily)
 //   Two consecutive weight-0 nodes (parent + child) = red-red violation
 //
-// After insert/erase, if more than HINT_N violations are counted on the path,
-// fix_all(key) applies one rebalancing step per call until the path is clean.
-// Failed rebalancing steps are harmless: a stale/unbalanced hint only lengthens
-// list traversal, never produces an incorrect result.
+// Memory reclamation: BSTNodeC tree nodes are reclaimed during a run through DEBRA
+// (retire_node -> retireRaw, on SCX commit/abort); any still-live nodes are freed by
+// ~BalancedHintBST via free_subtree. SCXRecC descriptor records can stay reachable by
+// helpers across epochs, so they are tracked in alloc_recs_ and freed only at shutdown.
 
 namespace bst_balanced_hint {
 
